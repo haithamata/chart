@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trade Chart Demo</title>
+<style>
+  html, body { margin:0; padding:0; background:#0e0e12; color:#ddd; font-family:Arial, sans-serif; }
+  #info { padding:10px 14px; font-size:14px; border-bottom:1px solid #222; }
+  #info b { color:#fff; }
+  .tag { display:inline-block; padding:2px 8px; border-radius:4px; margin-left:8px; font-size:12px; }
+  .long { background:#0d3d24; color:#3ddc84; }
+  .short { background:#3d0d0d; color:#ff6161; }
+  /* Fixed height, not 100vh: on mobile Safari the viewport height keeps
+     changing as the address bar slides in/out while scrolling, which made
+     the chart constantly resize/jitter. A fixed height is stable both
+     standalone and when embedded inside a page-builder widget block. */
+  #chart { width:100%; height:600px; }
+  #err { padding:14px; color:#ff6161; display:none; }
+  #help { padding:0 14px 14px; font-size:12px; color:#888; }
+</style>
+</head>
+<body>
+  <div id="info">Loading...</div>
+  <div id="chart"></div>
+  <div id="err"></div>
+  <div id="help">
+    Try changing the URL, e.g.:
+    <code>?s=ETHUSDT&d=short&e=3500&sl=3600&tp=3300&i=15m&h=16</code>
+    (short names: s=symbol, d=side, e=entry, i=interval, h=timeout_hours, et=entry_time, x=exit —
+    the original long names still work too). If no entry/sl/tp are given, demo values are computed
+    from the last close. <code>h</code> controls how far the shaded zone/chart extends to the right
+    (default 8h). For a TRADE CLOSED alert, pass <code>et</code> (unix seconds, e.g. from the paper
+    trade log's Time column) so the zone anchors at the actual entry bar instead of "now", and
+    <code>x</code> to mark the close price.
+  </div>
+
+<script>
+// Accepts short param names (used by newly-sent alerts) with a fallback to
+// the original long names, so older Chart links already sent/tested still
+// work unchanged.
+function getParam(names, def) {
+  const qs = new URLSearchParams(window.location.search);
+  for (const n of (Array.isArray(names) ? names : [names])) {
+    const v = qs.get(n);
+    if (v !== null && v !== "") return v;
+  }
+  return def;
+}
+
+const symbol   = getParam(['s', 'symbol'], 'BTCUSDT').toUpperCase();
+const side     = getParam(['d', 'side'], 'long').toLowerCase();
+const interval = getParam(['i', 'interval'], '15m');
+const id       = getParam('id', 'DEMO');
+let entry = parseFloat(getParam(['e', 'entry'], ''));
+let sl    = parseFloat(getParam('sl', ''));
+let tp    = parseFloat(getParam('tp', ''));
+// Optional: actual close price for a TRADE CLOSED alert. Only drawn if present
+// — trailing/timeout exits can land somewhere other than exactly SL or TP.
+let exitPrice = parseFloat(getParam(['x', 'exit'], ''));
+// Optional: unix seconds of the actual entry bar. Both OPEN and CLOSED alerts
+// pass this (the bot stamps it when the message is built), since the chart
+// may be opened well after the alert was sent -- without it, the anchor
+// would silently drift to whatever candle is latest when the page loads,
+// instead of when the trade actually opened. If it's ever missing, we fall
+// back to anchoring at the latest candle. Otherwise the reward/risk zone
+// would incorrectly anchor at "now" instead of when the trade actually opened.
+const entryTimeParam = parseFloat(getParam(['et', 'entry_time'], ''));
+
+// How long the trade is allowed to run before the bot's timeout exit kicks in.
+// Match this to whichever engine placed the trade, e.g.:
+//   TM_MAX_HOLD_HOURS = 8, RFD_FINAL_TIMEOUT_HOURS = 16, COIL_FINAL_TIMEOUT_HOURS = 24
+// Defaults to 8h if not passed in the link.
+const timeoutHours = parseFloat(getParam(['h', 'timeout_hours'], '8'));
+
+const UNIT_SECONDS = { m: 60, h: 3600, d: 86400, w: 604800, M: 2592000 };
+function parseIntervalSeconds(iv) {
+  const match = /^(\d+)([mhdwM])$/.exec(iv);
+  if (!match) return 900;
+  return parseInt(match[1], 10) * UNIT_SECONDS[match[2]];
+}
+
+// Lightweight Charts always labels the time axis as if timestamps were UTC,
+// with no automatic conversion to the viewer's local timezone. Binance
+// candle times ARE real UTC, so left alone, the axis shows raw UTC clock
+// times instead of matching your wall clock (e.g. showing "12:00" when it's
+// actually 15:00 where you are, a 3-hour Cairo/UTC+3 gap). All time math
+// below (intervals, timeout window, nearest-candle snapping) stays in real
+// UTC seconds throughout -- this offset is applied only at the very end,
+// right when handing times to setData()/setVisibleRange(), purely so the
+// axis LABELS match the viewer's own browser clock.
+const tzOffsetSec = -new Date().getTimezoneOffset() * 60;
+const shift = (t) => t + tzOffsetSec;
+
+const intervalSec = parseIntervalSeconds(interval);
+const timeoutSeconds = timeoutHours * 3600;
+const timeoutBars = Math.max(1, Math.round(timeoutSeconds / intervalSec));
+// Lightweight Charts spaces points by index, not by real elapsed time, so a
+// zone series with only a start/end point collapses into a single bar-width
+// no matter how many hours it spans. Below we generate one point per bar
+// across the whole timeout window so the fill is genuinely `timeoutBars` wide.
+// This offset is purely cosmetic breathing room shown *after* that fill ends.
+const RIGHT_OFFSET_BARS = 4;
+
+// Load the charting library ourselves (rather than a static <script src> tag
+// in <head>, which blocks the whole page from rendering anything -- even the
+// dark background -- until it finishes). If unpkg is slow/blocked on a given
+// network, that used to mean a totally blank white page with no way to tell
+// what was wrong. Now the page paints immediately either way, tries a second
+// CDN if the first fails, and shows a real error instead of hanging forever.
+function loadScript(src, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    const t = setTimeout(() => { s.remove(); reject(new Error('timed out loading ' + src)); }, timeoutMs);
+    s.onload = () => { clearTimeout(t); resolve(); };
+    s.onerror = () => { clearTimeout(t); s.remove(); reject(new Error('failed to load ' + src)); };
+    document.head.appendChild(s);
+  });
+}
+
+async function loadLightweightCharts() {
+  const sources = [
+    'https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js',
+    'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js',
+  ];
+  let lastErr;
+  for (const src of sources) {
+    try {
+      await loadScript(src, 10000);
+      if (window.LightweightCharts) return;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('LightweightCharts did not load from any source');
+}
+
+function showFatalError(msg) {
+  document.getElementById('info').textContent = 'Failed to load chart';
+  const e = document.getElementById('err');
+  e.style.display = 'block';
+  e.textContent = msg;
+}
+
+loadLightweightCharts().then(boot).catch(err => {
+  showFatalError('Could not load the charting library: ' + err.message +
+    '\nThis usually means the CDN is slow or blocked on this network, not a bug in the page itself.');
+});
+
+function boot() {
+
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+  layout: { background: { color: '#0e0e12' }, textColor: '#ddd' },
+  grid: { vertLines: { color: '#1c1c22' }, horzLines: { color: '#1c1c22' } },
+  timeScale: { timeVisible: true, secondsVisible: false, rightOffset: RIGHT_OFFSET_BARS },
+});
+
+// Zone series are created BEFORE the candle series so they paint underneath the candles.
+function makeZoneSeries() {
+  return chart.addBaselineSeries({
+    lineWidth: 1,
+    topLineColor: 'rgba(0,0,0,0)',
+    bottomLineColor: 'rgba(0,0,0,0)',
+    priceLineVisible: false,
+    lastValueVisible: false,
+    crosshairMarkerVisible: false,
+  });
+}
+const tpZoneSeries = makeZoneSeries();
+const slZoneSeries = makeZoneSeries();
+
+const candleSeries = chart.addCandlestickSeries({
+  upColor: '#26a69a', downColor: '#ef5350',
+  borderVisible: false, wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+});
+
+new ResizeObserver(entries => {
+  for (const e of entries) chart.applyOptions({ width: e.contentRect.width, height: e.contentRect.height });
+}).observe(document.getElementById('chart'));
+
+async function fetchCandles() {
+  // Try Binance USD-M Futures first, fall back to Spot.
+  const urls = [
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=200`,
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=200`,
+  ];
+  let lastErr;
+  for (const url of urls) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      if (!Array.isArray(data) || data.length === 0) throw new Error('empty response');
+      return data.map(d => ({ time: d[0] / 1000, open: +d[1], high: +d[2], low: +d[3], close: +d[4] }));
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
+fetchCandles().then(candles => {
+  // `candles` (raw UTC) is kept as-is for all internal time math below;
+  // only the copy actually handed to the chart gets the display shift.
+  candleSeries.setData(candles.map(c => ({ ...c, time: shift(c.time) })));
+
+  const lastClose = candles[candles.length - 1].close;
+  if (isNaN(entry)) entry = lastClose;
+  if (isNaN(sl)) sl = side === 'short' ? entry * 1.01 : entry * 0.99;
+  if (isNaN(tp)) tp = side === 'short' ? entry * 0.98 : entry * 1.02;
+
+  // ENTRY stays a full-width price line (useful as a reference level against
+  // historical price action too). SL/TP/EXIT are drawn further below as
+  // segments clipped to start at the entry bar — see zonePoints.
+  candleSeries.createPriceLine({ price: entry, color: '#2962FF', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid,  axisLabelVisible: true, title: 'ENTRY' });
+
+  // Zones/levels start at the entry bar (the "now" candle for an OPEN alert)
+  // and extend forward exactly as far as the trade's timeout window, rather
+  // than coloring/drawing across historical candles before the trade
+  // existed. For a CLOSED trade, "entry" is a past bar (entry_time), not
+  // "now" — snap to the nearest actual candle time so points land on the
+  // same index grid as the candles (an arbitrary timestamp not aligned to a
+  // real bar would throw off the equal bar-width spacing Lightweight Charts
+  // relies on).
+  let entryTime = candles[candles.length - 1].time;
+  if (!isNaN(entryTimeParam)) {
+    let best = candles[0].time, bestDiff = Math.abs(candles[0].time - entryTimeParam);
+    for (const c of candles) {
+      const diff = Math.abs(c.time - entryTimeParam);
+      if (diff < bestDiff) { bestDiff = diff; best = c.time; }
+    }
+    entryTime = best;
+  }
+  // One point per bar, matching the real candle spacing, for `timeoutBars`
+  // bars — this is what makes the fill's on-screen width exactly the
+  // timeout window instead of collapsing to one index slot. Also used below
+  // as the shared time range for the clipped SL/TP/EXIT line segments.
+  const zonePoints = [];
+  for (let i = 0; i <= timeoutBars; i++) zonePoints.push(entryTime + i * intervalSec);
+
+  // SL/TP/EXIT as line segments (not createPriceLine, which always spans the
+  // full chart width) so they only appear from the entry bar forward, same
+  // as the shaded zones — no dashed lines cluttering pre-entry history.
+  function levelLine(color, lineStyle, title) {
+    return chart.addLineSeries({
+      color, lineWidth: 2, lineStyle, title,
+      priceLineVisible: false, lastValueVisible: true,
+      crosshairMarkerVisible: false,
+    });
+  }
+  levelLine('#ff3b30', LightweightCharts.LineStyle.Dashed, 'SL')
+    .setData(zonePoints.map(t => ({ time: shift(t), value: sl })));
+  levelLine('#00c853', LightweightCharts.LineStyle.Dashed, 'TP')
+    .setData(zonePoints.map(t => ({ time: shift(t), value: tp })));
+  if (!isNaN(exitPrice)) {
+    levelLine('#b0b0b0', LightweightCharts.LineStyle.Dotted, 'EXIT')
+      .setData(zonePoints.map(t => ({ time: shift(t), value: exitPrice })));
+  }
+
+  const GREEN = ['rgba(0,200,83,0.28)', 'rgba(0,200,83,0.02)'];
+  const RED   = ['rgba(255,59,48,0.28)', 'rgba(255,59,48,0.02)'];
+  const NONE  = ['rgba(0,0,0,0)', 'rgba(0,0,0,0)'];
+
+  const tpAbove = tp > entry; // true for long TP, false for short TP
+  tpZoneSeries.applyOptions({
+    baseValue: { type: 'price', price: entry },
+    topFillColor1: tpAbove ? GREEN[0] : NONE[0], topFillColor2: tpAbove ? GREEN[1] : NONE[1],
+    bottomFillColor1: tpAbove ? NONE[0] : GREEN[0], bottomFillColor2: tpAbove ? NONE[1] : GREEN[1],
+  });
+  tpZoneSeries.setData(zonePoints.map(t => ({ time: shift(t), value: tp })));
+
+  const slAbove = sl > entry; // true for short SL, false for long SL
+  slZoneSeries.applyOptions({
+    baseValue: { type: 'price', price: entry },
+    topFillColor1: slAbove ? RED[0] : NONE[0], topFillColor2: slAbove ? RED[1] : NONE[1],
+    bottomFillColor1: slAbove ? NONE[0] : RED[0], bottomFillColor2: slAbove ? NONE[1] : RED[1],
+  });
+  slZoneSeries.setData(zonePoints.map(t => ({ time: shift(t), value: sl })));
+
+  // Default zoom: show some pre-entry context plus the full timeout window,
+  // rather than fitContent()'s "fit literally everything fetched" (200
+  // historical candles), which shrinks the actual trade setup down to a
+  // sliver. Bars of lookback scale with the timeout window so a longer
+  // timeout still gets proportionate context. You can still scroll/zoom out
+  // manually afterward to see the full fetched history.
+  const lookbackBars = Math.max(20, Math.round(timeoutBars * 1.5));
+  const viewFrom = entryTime - lookbackBars * intervalSec;
+  const viewTo = zonePoints[zonePoints.length - 1] + RIGHT_OFFSET_BARS * intervalSec;
+  chart.timeScale().setVisibleRange({ from: shift(viewFrom), to: shift(viewTo) });
+
+  document.getElementById('info').innerHTML =
+    `<b>${symbol}</b> ${interval} <span class="tag ${side}">${side.toUpperCase()}</span>` +
+    ` &nbsp; Entry <b>${entry.toFixed(4)}</b> &nbsp; SL <b>${sl.toFixed(4)}</b> &nbsp; TP <b>${tp.toFixed(4)}</b>` +
+    (!isNaN(exitPrice) ? ` &nbsp; Exit <b>${exitPrice.toFixed(4)}</b>` : '') +
+    ` &nbsp; Timeout <b>${timeoutHours}h</b> &nbsp; ID: ${id}`;
+}).catch(err => {
+  showFatalError('Error fetching candle data: ' + err.message +
+    '\nIf this is a CORS / file:// restriction in your browser, serve this folder locally instead, e.g.:\n' +
+    '  python -m http.server 8000\nthen open http://localhost:8000/trade_chart_demo.html?symbol=BTCUSDT...');
+});
+
+} // end boot()
+</script>
+</body>
+</html>
