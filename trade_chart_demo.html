@@ -79,6 +79,20 @@ function parseIntervalSeconds(iv) {
   return parseInt(match[1], 10) * UNIT_SECONDS[match[2]];
 }
 
+// Lightweight Charts defaults to 2 decimal places on the price axis, fine
+// for BTC (~65000) but useless for sub-cent altcoins (e.g. TLM ~0.002) --
+// every price label rounds down to "0.00". Scale decimals to the price's
+// own magnitude instead, applied to the candles and every price line/zone.
+function pricePrecisionFor(price) {
+  const p = Math.abs(price);
+  if (!p || !isFinite(p)) return 2;
+  if (p >= 100) return 2;
+  if (p >= 1) return 4;
+  if (p >= 0.01) return 6;
+  if (p >= 0.0001) return 8;
+  return 10;
+}
+
 // Lightweight Charts always labels the time axis as if timestamps were UTC,
 // with no automatic conversion to the viewer's local timezone. Binance
 // candle times ARE real UTC, so left alone, the axis shows raw UTC clock
@@ -205,6 +219,13 @@ fetchCandles().then(candles => {
   if (isNaN(sl)) sl = side === 'short' ? entry * 1.01 : entry * 0.99;
   if (isNaN(tp)) tp = side === 'short' ? entry * 0.98 : entry * 1.02;
 
+  // Precision sized to this trade's actual price magnitude (see
+  // pricePrecisionFor above) -- applied to candles and every price line/zone
+  // below so labels show real digits instead of rounding to 0.00.
+  const pricePrecision = pricePrecisionFor(entry);
+  const priceFormat = { type: 'price', precision: pricePrecision, minMove: 1 / Math.pow(10, pricePrecision) };
+  candleSeries.applyOptions({ priceFormat });
+
   // ENTRY stays a full-width price line (useful as a reference level against
   // historical price action too). SL/TP/EXIT are drawn further below as
   // segments clipped to start at the entry bar — see zonePoints.
@@ -239,7 +260,7 @@ fetchCandles().then(candles => {
   // as the shaded zones — no dashed lines cluttering pre-entry history.
   function levelLine(color, lineStyle, title) {
     return chart.addLineSeries({
-      color, lineWidth: 2, lineStyle, title,
+      color, lineWidth: 2, lineStyle, title, priceFormat,
       priceLineVisible: false, lastValueVisible: true,
       crosshairMarkerVisible: false,
     });
@@ -259,7 +280,7 @@ fetchCandles().then(candles => {
 
   const tpAbove = tp > entry; // true for long TP, false for short TP
   tpZoneSeries.applyOptions({
-    baseValue: { type: 'price', price: entry },
+    baseValue: { type: 'price', price: entry }, priceFormat,
     topFillColor1: tpAbove ? GREEN[0] : NONE[0], topFillColor2: tpAbove ? GREEN[1] : NONE[1],
     bottomFillColor1: tpAbove ? NONE[0] : GREEN[0], bottomFillColor2: tpAbove ? NONE[1] : GREEN[1],
   });
@@ -267,7 +288,7 @@ fetchCandles().then(candles => {
 
   const slAbove = sl > entry; // true for short SL, false for long SL
   slZoneSeries.applyOptions({
-    baseValue: { type: 'price', price: entry },
+    baseValue: { type: 'price', price: entry }, priceFormat,
     topFillColor1: slAbove ? RED[0] : NONE[0], topFillColor2: slAbove ? RED[1] : NONE[1],
     bottomFillColor1: slAbove ? NONE[0] : RED[0], bottomFillColor2: slAbove ? NONE[1] : RED[1],
   });
@@ -286,8 +307,8 @@ fetchCandles().then(candles => {
 
   document.getElementById('info').innerHTML =
     `<b>${symbol}</b> ${interval} <span class="tag ${side}">${side.toUpperCase()}</span>` +
-    ` &nbsp; Entry <b>${entry.toFixed(4)}</b> &nbsp; SL <b>${sl.toFixed(4)}</b> &nbsp; TP <b>${tp.toFixed(4)}</b>` +
-    (!isNaN(exitPrice) ? ` &nbsp; Exit <b>${exitPrice.toFixed(4)}</b>` : '') +
+    ` &nbsp; Entry <b>${entry.toFixed(pricePrecision)}</b> &nbsp; SL <b>${sl.toFixed(pricePrecision)}</b> &nbsp; TP <b>${tp.toFixed(pricePrecision)}</b>` +
+    (!isNaN(exitPrice) ? ` &nbsp; Exit <b>${exitPrice.toFixed(pricePrecision)}</b>` : '') +
     ` &nbsp; Timeout <b>${timeoutHours}h</b> &nbsp; ID: ${id}`;
 }).catch(err => {
   showFatalError('Error fetching candle data: ' + err.message +
