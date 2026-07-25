@@ -17,10 +17,23 @@
   #chart { width:100%; height:600px; }
   #err { padding:14px; color:#ff6161; display:none; }
   #help { padding:0 14px 14px; font-size:12px; color:#888; }
+  #tf { padding:8px 14px; border-bottom:1px solid #222; display:flex; gap:6px; }
+  #tf button {
+    background:#1c1c22; color:#aaa; border:1px solid #2a2a32; border-radius:4px;
+    padding:4px 14px; font-size:12px; cursor:pointer; font-family:inherit;
+  }
+  #tf button:hover { background:#26262e; color:#ddd; }
+  #tf button.active { background:#2962FF; color:#fff; border-color:#2962FF; }
 </style>
 </head>
 <body>
   <div id="info">Loading...</div>
+  <div id="tf">
+    <button data-tf="5m">5m</button>
+    <button data-tf="15m">15m</button>
+    <button data-tf="1h">1H</button>
+    <button data-tf="4h">4H</button>
+  </div>
   <div id="chart"></div>
   <div id="err"></div>
   <div id="help">
@@ -49,7 +62,10 @@ function getParam(names, def) {
 
 const symbol   = getParam(['s', 'symbol'], 'BTCUSDT').toUpperCase();
 const side     = getParam(['d', 'side'], 'long').toLowerCase();
-const interval = getParam(['i', 'interval'], '15m');
+// Mutable: the timeframe switcher (5m/15m/1H/4H buttons) re-assigns this and
+// re-renders, rather than the page only ever honoring whatever interval the
+// link was originally sent with.
+let interval   = getParam(['i', 'interval'], '15m');
 const id       = getParam('id', 'DEMO');
 let entry = parseFloat(getParam(['e', 'entry'], ''));
 let sl    = parseFloat(getParam('sl', ''));
@@ -105,9 +121,10 @@ function pricePrecisionFor(price) {
 const tzOffsetSec = -new Date().getTimezoneOffset() * 60;
 const shift = (t) => t + tzOffsetSec;
 
-const intervalSec = parseIntervalSeconds(interval);
-const timeoutSeconds = timeoutHours * 3600;
-const timeoutBars = Math.max(1, Math.round(timeoutSeconds / intervalSec));
+// intervalSec/timeoutBars used to be computed once here, but now that the
+// timeframe switcher can change `interval` at runtime, they're recomputed
+// inside renderInterval() below on every render instead.
+//
 // Lightweight Charts spaces points by index, not by real elapsed time, so a
 // zone series with only a start/end point collapses into a single bar-width
 // no matter how many hours it spans. Below we generate one point per bar
@@ -186,15 +203,36 @@ const candleSeries = chart.addCandlestickSeries({
   borderVisible: false, wickUpColor: '#26a69a', wickDownColor: '#ef5350',
 });
 
+// SL/TP/EXIT as line segments (not createPriceLine, which always spans the
+// full chart width) so they only appear from the entry bar forward, same as
+// the shaded zones. Created ONCE here and reused (.setData() only) across
+// timeframe switches — creating a fresh series on every switch would stack
+// duplicate lines on top of each other instead of replacing them.
+function levelLineSeries(color, lineStyle, title) {
+  return chart.addLineSeries({
+    color, lineWidth: 2, lineStyle, title,
+    priceLineVisible: false, lastValueVisible: true,
+    crosshairMarkerVisible: false,
+  });
+}
+const slLine   = levelLineSeries('#ff3b30', LightweightCharts.LineStyle.Dashed, 'SL');
+const tpLine   = levelLineSeries('#00c853', LightweightCharts.LineStyle.Dashed, 'TP');
+const exitLine = !isNaN(exitPrice) ? levelLineSeries('#b0b0b0', LightweightCharts.LineStyle.Dotted, 'EXIT') : null;
+
+// createPriceLine() has no "update" — it just adds another line. The entry
+// price itself never changes when switching timeframes, so it's drawn once
+// and left alone rather than stacking a duplicate on every switch.
+let entryLineDrawn = false;
+
 new ResizeObserver(entries => {
   for (const e of entries) chart.applyOptions({ width: e.contentRect.width, height: e.contentRect.height });
 }).observe(document.getElementById('chart'));
 
-async function fetchCandles() {
+async function fetchCandles(iv) {
   // Try Binance USD-M Futures first, fall back to Spot.
   const urls = [
-    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=200`,
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=200`,
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${iv}&limit=200`,
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${iv}&limit=200`,
   ];
   let lastErr;
   for (const url of urls) {
@@ -209,7 +247,26 @@ async function fetchCandles() {
   throw lastErr;
 }
 
-fetchCandles().then(candles => {
+const tfButtons = document.querySelectorAll('#tf button');
+function setActiveTfButton(iv) {
+  tfButtons.forEach(b => b.classList.toggle('active', b.dataset.tf === iv));
+}
+
+// Renders (or re-renders, on a timeframe switch) the whole chart for a given
+// interval: fetches that timeframe's candles, then redraws everything that
+// depends on bar spacing (zone fills, SL/TP/EXIT segments, default zoom).
+// entry/sl/tp/exitPrice themselves are NOT re-defaulted on a re-render — they
+// represent the trade's actual fixed levels and must stay the same no matter
+// which timeframe is being viewed.
+async function renderInterval(iv) {
+  interval = iv;
+  setActiveTfButton(iv);
+
+  const intervalSec = parseIntervalSeconds(iv);
+  const timeoutSeconds = timeoutHours * 3600;
+  const timeoutBars = Math.max(1, Math.round(timeoutSeconds / intervalSec));
+
+  const candles = await fetchCandles(iv);
   // `candles` (raw UTC) is kept as-is for all internal time math below;
   // only the copy actually handed to the chart gets the display shift.
   candleSeries.setData(candles.map(c => ({ ...c, time: shift(c.time) })));
@@ -225,11 +282,17 @@ fetchCandles().then(candles => {
   const pricePrecision = pricePrecisionFor(entry);
   const priceFormat = { type: 'price', precision: pricePrecision, minMove: 1 / Math.pow(10, pricePrecision) };
   candleSeries.applyOptions({ priceFormat });
+  slLine.applyOptions({ priceFormat });
+  tpLine.applyOptions({ priceFormat });
+  if (exitLine) exitLine.applyOptions({ priceFormat });
 
   // ENTRY stays a full-width price line (useful as a reference level against
   // historical price action too). SL/TP/EXIT are drawn further below as
   // segments clipped to start at the entry bar — see zonePoints.
-  candleSeries.createPriceLine({ price: entry, color: '#2962FF', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid,  axisLabelVisible: true, title: 'ENTRY' });
+  if (!entryLineDrawn) {
+    candleSeries.createPriceLine({ price: entry, color: '#2962FF', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'ENTRY' });
+    entryLineDrawn = true;
+  }
 
   // Zones/levels start at the entry bar (the "now" candle for an OPEN alert)
   // and extend forward exactly as far as the trade's timeout window, rather
@@ -238,7 +301,8 @@ fetchCandles().then(candles => {
   // "now" — snap to the nearest actual candle time so points land on the
   // same index grid as the candles (an arbitrary timestamp not aligned to a
   // real bar would throw off the equal bar-width spacing Lightweight Charts
-  // relies on).
+  // relies on). Re-snapped on every render since each timeframe has its own
+  // candle grid.
   let entryTime = candles[candles.length - 1].time;
   if (!isNaN(entryTimeParam)) {
     let best = candles[0].time, bestDiff = Math.abs(candles[0].time - entryTimeParam);
@@ -255,24 +319,9 @@ fetchCandles().then(candles => {
   const zonePoints = [];
   for (let i = 0; i <= timeoutBars; i++) zonePoints.push(entryTime + i * intervalSec);
 
-  // SL/TP/EXIT as line segments (not createPriceLine, which always spans the
-  // full chart width) so they only appear from the entry bar forward, same
-  // as the shaded zones — no dashed lines cluttering pre-entry history.
-  function levelLine(color, lineStyle, title) {
-    return chart.addLineSeries({
-      color, lineWidth: 2, lineStyle, title, priceFormat,
-      priceLineVisible: false, lastValueVisible: true,
-      crosshairMarkerVisible: false,
-    });
-  }
-  levelLine('#ff3b30', LightweightCharts.LineStyle.Dashed, 'SL')
-    .setData(zonePoints.map(t => ({ time: shift(t), value: sl })));
-  levelLine('#00c853', LightweightCharts.LineStyle.Dashed, 'TP')
-    .setData(zonePoints.map(t => ({ time: shift(t), value: tp })));
-  if (!isNaN(exitPrice)) {
-    levelLine('#b0b0b0', LightweightCharts.LineStyle.Dotted, 'EXIT')
-      .setData(zonePoints.map(t => ({ time: shift(t), value: exitPrice })));
-  }
+  slLine.setData(zonePoints.map(t => ({ time: shift(t), value: sl })));
+  tpLine.setData(zonePoints.map(t => ({ time: shift(t), value: tp })));
+  if (exitLine) exitLine.setData(zonePoints.map(t => ({ time: shift(t), value: exitPrice })));
 
   const GREEN = ['rgba(0,200,83,0.28)', 'rgba(0,200,83,0.02)'];
   const RED   = ['rgba(255,59,48,0.28)', 'rgba(255,59,48,0.02)'];
@@ -306,11 +355,30 @@ fetchCandles().then(candles => {
   chart.timeScale().setVisibleRange({ from: shift(viewFrom), to: shift(viewTo) });
 
   document.getElementById('info').innerHTML =
-    `<b>${symbol}</b> ${interval} <span class="tag ${side}">${side.toUpperCase()}</span>` +
+    `<b>${symbol}</b> ${iv} <span class="tag ${side}">${side.toUpperCase()}</span>` +
     ` &nbsp; Entry <b>${entry.toFixed(pricePrecision)}</b> &nbsp; SL <b>${sl.toFixed(pricePrecision)}</b> &nbsp; TP <b>${tp.toFixed(pricePrecision)}</b>` +
     (!isNaN(exitPrice) ? ` &nbsp; Exit <b>${exitPrice.toFixed(pricePrecision)}</b>` : '') +
     ` &nbsp; Timeout <b>${timeoutHours}h</b> &nbsp; ID: ${id}`;
-}).catch(err => {
+
+  // Reflect the chosen timeframe in the address bar (no reload) so a
+  // reloaded or re-shared link reopens on the same timeframe instead of
+  // always reverting to whatever the alert originally specified.
+  const url = new URL(window.location);
+  url.searchParams.set('i', iv);
+  url.searchParams.delete('interval');
+  history.replaceState({}, '', url);
+}
+
+tfButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.tf === interval) return;
+    renderInterval(btn.dataset.tf).catch(err => {
+      showFatalError('Error fetching candle data: ' + err.message);
+    });
+  });
+});
+
+renderInterval(interval).catch(err => {
   showFatalError('Error fetching candle data: ' + err.message +
     '\nIf this is a CORS / file:// restriction in your browser, serve this folder locally instead, e.g.:\n' +
     '  python -m http.server 8000\nthen open http://localhost:8000/trade_chart_demo.html?symbol=BTCUSDT...');
