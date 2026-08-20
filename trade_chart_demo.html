@@ -218,11 +218,10 @@ function levelLineSeries(color, lineStyle, title) {
 const slLine   = levelLineSeries('#ff3b30', LightweightCharts.LineStyle.Dashed, 'SL');
 const tpLine   = levelLineSeries('#00c853', LightweightCharts.LineStyle.Dashed, 'TP');
 const exitLine = !isNaN(exitPrice) ? levelLineSeries('#b0b0b0', LightweightCharts.LineStyle.Dotted, 'EXIT') : null;
-
-// createPriceLine() has no "update" — it just adds another line. The entry
-// price itself never changes when switching timeframes, so it's drawn once
-// and left alone rather than stacking a duplicate on every switch.
-let entryLineDrawn = false;
+// ENTRY as a clipped segment too (2026-08-20, user: "don't extend the
+// entry blue line back beyond the open position time"). It was the one
+// remaining createPriceLine(), which always spans the full chart width.
+const entryLine = levelLineSeries('#2962FF', LightweightCharts.LineStyle.Solid, 'ENTRY');
 
 new ResizeObserver(entries => {
   for (const e of entries) chart.applyOptions({ width: e.contentRect.width, height: e.contentRect.height });
@@ -286,13 +285,10 @@ async function renderInterval(iv) {
   tpLine.applyOptions({ priceFormat });
   if (exitLine) exitLine.applyOptions({ priceFormat });
 
-  // ENTRY stays a full-width price line (useful as a reference level against
-  // historical price action too). SL/TP/EXIT are drawn further below as
-  // segments clipped to start at the entry bar — see zonePoints.
-  if (!entryLineDrawn) {
-    candleSeries.createPriceLine({ price: entry, color: '#2962FF', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'ENTRY' });
-    entryLineDrawn = true;
-  }
+  // ENTRY is drawn further below as a clipped segment (zonePoints),
+  // exactly like SL/TP/EXIT - it must not extend back before the
+  // position's open time.
+  entryLine.applyOptions({ priceFormat });
 
   // Zones/levels start at the entry bar (the "now" candle for an OPEN alert)
   // and extend forward exactly as far as the trade's timeout window, rather
@@ -319,6 +315,7 @@ async function renderInterval(iv) {
   const zonePoints = [];
   for (let i = 0; i <= timeoutBars; i++) zonePoints.push(entryTime + i * intervalSec);
 
+  entryLine.setData(zonePoints.map(t => ({ time: shift(t), value: entry })));
   slLine.setData(zonePoints.map(t => ({ time: shift(t), value: sl })));
   tpLine.setData(zonePoints.map(t => ({ time: shift(t), value: tp })));
   if (exitLine) exitLine.setData(zonePoints.map(t => ({ time: shift(t), value: exitPrice })));
