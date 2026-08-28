@@ -227,11 +227,22 @@ new ResizeObserver(entries => {
   for (const e of entries) chart.applyOptions({ width: e.contentRect.width, height: e.contentRect.height });
 }).observe(document.getElementById('chart'));
 
-async function fetchCandles(iv) {
+async function fetchCandles(iv, startSec, limit) {
   // Try Binance USD-M Futures first, fall back to Spot.
+  //
+  // startSec (2026-08-28 fix): when the link carries et (entry time), fetch
+  // history AROUND the trade instead of the newest bars. The page used to
+  // always fetch the latest 200 candles, so any trade older than that window
+  // (e.g. a 10-day-old POODLE link on 15m = only ~2 days loaded) had NO
+  // candles covering it -- the anchor then snapped to the nearest loaded
+  // candle and the whole position drew at the chart's edge, "totally off
+  // chart". With startSec the trade's own candles are always loaded, at any
+  // age, on any timeframe.
+  const lim = Math.min(1500, Math.max(200, limit || 200));
+  const range = startSec ? `&startTime=${Math.floor(startSec * 1000)}` : '';
   const urls = [
-    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${iv}&limit=200`,
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${iv}&limit=200`,
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${iv}&limit=${lim}${range}`,
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${iv}&limit=${lim}${range}`,
   ];
   let lastErr;
   for (const url of urls) {
@@ -265,7 +276,16 @@ async function renderInterval(iv) {
   const timeoutSeconds = timeoutHours * 3600;
   const timeoutBars = Math.max(1, Math.round(timeoutSeconds / intervalSec));
 
-  const candles = await fetchCandles(iv);
+  // With et in the link, load history around the TRADE (lookback context +
+  // the full timeout window + margin), so old trades render at their real
+  // bars instead of snapping to the edge of a newest-200 window.
+  let fetchStart = null, fetchLimit = 200;
+  if (!isNaN(entryTimeParam)) {
+    const lookback = Math.max(20, Math.round(timeoutBars * 1.5));
+    fetchStart = entryTimeParam - lookback * intervalSec;
+    fetchLimit = lookback + timeoutBars + RIGHT_OFFSET_BARS + 10;
+  }
+  const candles = await fetchCandles(iv, fetchStart, fetchLimit);
   // `candles` (raw UTC) is kept as-is for all internal time math below;
   // only the copy actually handed to the chart gets the display shift.
   candleSeries.setData(candles.map(c => ({ ...c, time: shift(c.time) })));
@@ -300,6 +320,7 @@ async function renderInterval(iv) {
   // relies on). Re-snapped on every render since each timeframe has its own
   // candle grid.
   let entryTime = candles[candles.length - 1].time;
+  let anchorWarn = '';
   if (!isNaN(entryTimeParam)) {
     let best = candles[0].time, bestDiff = Math.abs(candles[0].time - entryTimeParam);
     for (const c of candles) {
@@ -307,6 +328,18 @@ async function renderInterval(iv) {
       if (diff < bestDiff) { bestDiff = diff; best = c.time; }
     }
     entryTime = best;
+    // If even targeted fetching couldn't cover the entry time (delisted
+    // symbol, extreme age), say so instead of silently drawing at an edge.
+    if (bestDiff > 2 * intervalSec) {
+      anchorWarn = 'entry time outside loaded history - position anchored approximately';
+    }
+  } else {
+    // Old links (pre 2026-08-27) carry no et: the anchor falls back to the
+    // LATEST candle, which for anything but a just-opened trade puts the
+    // zone visibly in the wrong place (the "position totally off chart"
+    // report, POODL-FIL 08-18 link). Newer alerts always carry et; flag the
+    // old ones honestly.
+    anchorWarn = 'no entry time (et) in this link - zone anchored at the latest candle';
   }
   // One point per bar, matching the real candle spacing, for `timeoutBars`
   // bars — this is what makes the fill's on-screen width exactly the
@@ -351,11 +384,19 @@ async function renderInterval(iv) {
   const viewTo = zonePoints[zonePoints.length - 1] + RIGHT_OFFSET_BARS * intervalSec;
   chart.timeScale().setVisibleRange({ from: shift(viewFrom), to: shift(viewTo) });
 
+  // Entry-bar time shown in the viewer's local clock, so the anchor is
+  // verifiable at a glance against the alert's send time.
+  const entryLocal = new Date(entryTime * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const entryTxt = `${pad(entryLocal.getDate())}.${pad(entryLocal.getMonth() + 1)} ` +
+                   `${pad(entryLocal.getHours())}:${pad(entryLocal.getMinutes())}`;
   document.getElementById('info').innerHTML =
     `<b>${symbol}</b> ${iv} <span class="tag ${side}">${side.toUpperCase()}</span>` +
-    ` &nbsp; Entry <b>${entry.toFixed(pricePrecision)}</b> &nbsp; SL <b>${sl.toFixed(pricePrecision)}</b> &nbsp; TP <b>${tp.toFixed(pricePrecision)}</b>` +
+    ` &nbsp; Entry <b>${entry.toFixed(pricePrecision)}</b> @ <b>${entryTxt}</b>` +
+    ` &nbsp; SL <b>${sl.toFixed(pricePrecision)}</b> &nbsp; TP <b>${tp.toFixed(pricePrecision)}</b>` +
     (!isNaN(exitPrice) ? ` &nbsp; Exit <b>${exitPrice.toFixed(pricePrecision)}</b>` : '') +
-    ` &nbsp; Timeout <b>${timeoutHours}h</b> &nbsp; ID: ${id}`;
+    ` &nbsp; Timeout <b>${timeoutHours}h</b> &nbsp; ID: ${id}` +
+    (anchorWarn ? `<br><span style="color:#ff9f0a">&#9888; ${anchorWarn}</span>` : '');
 
   // Reflect the chosen timeframe in the address bar (no reload) so a
   // reloaded or re-shared link reopens on the same timeframe instead of
