@@ -65,7 +65,9 @@ const side     = getParam(['d', 'side'], 'long').toLowerCase();
 // Mutable: the timeframe switcher (5m/15m/1H/4H buttons) re-assigns this and
 // re-renders, rather than the page only ever honoring whatever interval the
 // link was originally sent with.
-let interval   = getParam(['i', 'interval'], '15m');
+// Default 1h (2026-08-29 user order) for links that carry no i= param;
+// the bot's own links set it explicitly from chart_defaults_for_source.
+let interval   = getParam(['i', 'interval'], '1h');
 const id       = getParam('id', 'DEMO');
 let entry = parseFloat(getParam(['e', 'entry'], ''));
 let sl    = parseFloat(getParam('sl', ''));
@@ -131,6 +133,17 @@ const shift = (t) => t + tzOffsetSec;
 // across the whole timeout window so the fill is genuinely `timeoutBars` wide.
 // This offset is purely cosmetic breathing room shown *after* that fill ends.
 const RIGHT_OFFSET_BARS = 4;
+
+// Minimum bars of pre-entry context (2026-08-29 user order: "show more past
+// bars (30) from entry time in the 1H frame"). The lookback is normally
+// timeoutBars * 1.5, which on 1h with an 8h timeout is only 12 bars -- this
+// floor is what actually decides the 1h/4h view. Lower timeframes have far
+// more timeout bars, so their proportional lookback already exceeds it and
+// is left untouched. Used for BOTH the history fetch and the default zoom,
+// so the bars requested and the bars shown always agree.
+const MIN_LOOKBACK_BARS = 30;
+const lookbackBarsFor = (timeoutBars) =>
+  Math.max(MIN_LOOKBACK_BARS, Math.round(timeoutBars * 1.5));
 
 // Load the charting library ourselves (rather than a static <script src> tag
 // in <head>, which blocks the whole page from rendering anything -- even the
@@ -281,7 +294,7 @@ async function renderInterval(iv) {
   // bars instead of snapping to the edge of a newest-200 window.
   let fetchStart = null, fetchLimit = 200;
   if (!isNaN(entryTimeParam)) {
-    const lookback = Math.max(20, Math.round(timeoutBars * 1.5));
+    const lookback = lookbackBarsFor(timeoutBars);
     fetchStart = entryTimeParam - lookback * intervalSec;
     fetchLimit = lookback + timeoutBars + RIGHT_OFFSET_BARS + 10;
   }
@@ -379,7 +392,7 @@ async function renderInterval(iv) {
   // sliver. Bars of lookback scale with the timeout window so a longer
   // timeout still gets proportionate context. You can still scroll/zoom out
   // manually afterward to see the full fetched history.
-  const lookbackBars = Math.max(20, Math.round(timeoutBars * 1.5));
+  const lookbackBars = lookbackBarsFor(timeoutBars);
   const viewFrom = entryTime - lookbackBars * intervalSec;
   const viewTo = zonePoints[zonePoints.length - 1] + RIGHT_OFFSET_BARS * intervalSec;
   chart.timeScale().setVisibleRange({ from: shift(viewFrom), to: shift(viewTo) });
