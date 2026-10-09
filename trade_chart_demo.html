@@ -141,7 +141,10 @@ const RIGHT_OFFSET_BARS = 4;
 // more timeout bars, so their proportional lookback already exceeds it and
 // is left untouched. Used for BOTH the history fetch and the default zoom,
 // so the bars requested and the bars shown always agree.
-const MIN_LOOKBACK_BARS = 30;
+// 2026-10-09 (user order "100 ok"): raised 30 -> 100, about four days of
+// context on 1h. Binance caps a klines call at 1500 bars and the fetch asks
+// for lookback + timeout + margin, so there is plenty of headroom.
+const MIN_LOOKBACK_BARS = 100;
 const lookbackBarsFor = (timeoutBars) =>
   Math.max(MIN_LOOKBACK_BARS, Math.round(timeoutBars * 1.5));
 
